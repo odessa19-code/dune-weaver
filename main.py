@@ -100,35 +100,37 @@ async def lifespan(app: FastAPI):
     async def connect_and_home():
         """Connect to device and perform homing in background."""
         try:
-            # Connect without homing first (fast)
-            await asyncio.to_thread(connection_manager.connect_device, False)
+            # Connect without homing first to allow position verification
+            init_result = await asyncio.to_thread(connection_manager.connect_device, homing=False)
 
-            # If connected, perform homing in background
+            # If connected, check if we actually need to home
             if state.conn and state.conn.is_connected():
-                logger.info("Device connected, starting homing in background...")
-                state.is_homing = True
-                try:
-                    success = await asyncio.to_thread(connection_manager.home)
-                    if not success:
-                        logger.warning("Background homing failed or was skipped")
-                        # If sensor homing failed, close connection and wait for user action
-                        if state.sensor_homing_failed:
-                            logger.error("Sensor homing failed - closing connection. User must check sensor or switch to crash homing.")
-                            if state.conn:
-                                await asyncio.to_thread(state.conn.close)
-                                state.conn = None
-                            return  # Don't proceed with auto-play
-                finally:
-                    state.is_homing = False
-                    logger.info("Background homing completed")
+                if init_result == "SKIPPED":
+                    logger.info("Device position verified and matched saved state. Skipping background homing.")
+                else:
+                    logger.info("Device connected, starting homing in background...")
+                    state.is_homing = True
+                    try:
+                        success = await asyncio.to_thread(connection_manager.home)
+                        if not success:
+                            logger.warning("Background homing failed or was skipped")
+                            if state.sensor_homing_failed:
+                                logger.error("Sensor homing failed - closing connection.")
+                                if state.conn:
+                                    await asyncio.to_thread(state.conn.close)
+                                    state.conn = None
+                                return 
+                    finally:
+                        state.is_homing = False
+                        logger.info("Background homing completed")
 
-                # After homing, check for auto_play mode
+                # After homing (or skipping), check for auto_play mode
                 if state.auto_play_enabled and state.auto_play_playlist:
-                    logger.info(f"Homing complete, checking auto_play playlist: {state.auto_play_playlist}")
+                    logger.info(f"Checking auto_play playlist: {state.auto_play_playlist}")
                     try:
                         playlist_exists = playlist_manager.get_playlist(state.auto_play_playlist) is not None
                         if not playlist_exists:
-                            logger.warning(f"Auto-play playlist '{state.auto_play_playlist}' not found. Clearing invalid reference.")
+                            logger.warning(f"Auto-play playlist '{state.auto_play_playlist}' not found.")
                             state.auto_play_playlist = None
                             state.save()
                         elif state.conn and state.conn.is_connected():
@@ -1245,7 +1247,7 @@ async def set_homing_config(request: HomingConfigRequest):
         state.save()
 
         mode_name = "crash" if request.homing_mode == 0 else "sensor"
-        logger.info(f"Homing mode set to {mode_name}, compass offset set to {request.angular_homing_offset_degrees}°")
+        logger.info(f"Homing mode set to {mode_name}, compass offset set to {request.angular_homing_offset_degrees}Â°")
         if request.auto_home_enabled is not None:
             logger.info(f"Auto-home enabled: {state.auto_home_enabled}, after {state.auto_home_after_patterns} patterns")
         return {"success": True, "message": "Homing configuration updated"}
@@ -1352,7 +1354,7 @@ async def debug_serial_open(request: DebugSerialRequest):
                 timeout=request.timeout
             )
             _debug_serial_connections[request.port] = ser
-            logger.info(f"Debug serial opened on {request.port}")
+            logger.info(f"Debug serial opened on {request.port}, Baud: {request.baudrate}")
             return {"success": True, "port": request.port, "baudrate": request.baudrate}
         except Exception as e:
             logger.error(f"Failed to open debug serial on {request.port}: {e}")
