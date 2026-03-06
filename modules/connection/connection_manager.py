@@ -72,7 +72,8 @@ class SerialConnection(BaseConnection):
         self.timeout = timeout
         self.lock = threading.RLock()
         logger.info(f'Connecting to Serial port {port}')
-        self.ser = serial.Serial(port, baudrate, timeout=timeout)
+        timeout_val = 5.0 if "rfcomm" in port.lower() else timeout
+        self.ser = serial.Serial(port, baudrate, timeout=timeout_val)
         state.port = port
         logger.info(f'Connected to Serial port {port}')
 
@@ -87,7 +88,13 @@ class SerialConnection(BaseConnection):
 
     def readline(self) -> str:
         with self.lock:
-            return self.ser.readline().decode().strip()
+            try:
+                # Use self.ser.timeout as a guide, but ensure we don't crash on decode
+                line = self.ser.readline()
+                return line.decode('utf-8', errors='ignore').strip()
+            except Exception as e:
+                logger.debug(f"Readline error: {e}")
+                return ""
 
     def in_waiting(self) -> int:
         with self.lock:
@@ -215,45 +222,50 @@ def device_init(homing=True):
 
     # Check machine position BEFORE reset to decide if homing is needed
     machine_x, machine_y = get_machine_position()
-    needs_homing = False
+    needs_reset_and_home = False
 
-    if machine_x != state.machine_x or machine_y != state.machine_y:
+    if machine_x is None:
+        logger.warning("Could not determine machine position. Forcing reset and homing for safety.")
+        needs_reset_and_home = True
+    elif machine_x != state.machine_x or machine_y != state.machine_y:
         logger.info(f'Machine position mismatch - machine: ({machine_x}, {machine_y}), saved: ({state.machine_x}, {state.machine_y})')
-        needs_homing = homing
+        needs_reset_and_home = True
     else:
-        logger.info('Machine position matches saved state, skipping home')
+        logger.info('Machine position matches saved state, skipping reset and home')
         logger.info(f'Theta: {state.current_theta}, rho: {state.current_rho}')
         logger.info(f'Position: ({machine_x}, {machine_y})')
+        needs_reset_and_home = False
 
-    # Now perform soft reset to ensure controller is in a clean state
-    # This clears any pending commands and resets position counters to 0
-    logger.info("Performing soft reset for clean controller state...")
-    perform_soft_reset_sync()
-    time.sleep(1)  # Extra stabilization after controller restart
+    # Only perform reset and homing if position is unknown or mismatched
+    if needs_reset_and_home:
+        # Now perform soft reset to ensure controller is in a clean state
+        # This clears any pending commands and resets position counters to 0
+        logger.info("Performing soft reset for clean controller state...")
+        perform_soft_reset_sync()
+        time.sleep(1)  # Extra stabilization after controller restart
 
-    # Reset work coordinate offsets for a clean start
-    # This ensures we're using work coordinates (G54) starting from 0
-    reset_work_coordinates()
+        # Reset work coordinate offsets for a clean start
+        # This ensures we're using work coordinates (G54) starting from 0
+        reset_work_coordinates()
 
-    # Home if position was mismatched (machine may have been power cycled)
-    if needs_homing:
-        logger.info("Homing required due to position mismatch...")
-        success = home()
-        if not success:
-            logger.error("Homing failed during device initialization")
-            # If sensor homing failed, close connection and return False
-            # This prevents auto-connection from completing until user takes action
-            if state.sensor_homing_failed:
-                logger.error("Sensor homing failed - closing connection. User must check sensor or switch to crash homing.")
-                state.conn.close()
-                state.conn = None
-                return False
-
+        # Home if position was mismatched (machine may have been power cycled)
+        if homing:
+            logger.info("Homing required due to position mismatch...")
+            success = home()
+            if not success:
+                logger.error("Homing failed during device initialization")
+                # If sensor homing failed, close connection and return False
+                # This prevents auto-connection from completing until user takes action
+                if state.sensor_homing_failed:
+                    logger.error("Sensor homing failed - closing connection. User must check sensor or switch to crash homing.")
+                    state.conn.close()
+                    state.conn = None
+                    return False
+    
     time.sleep(2)  # Allow time for the connection to establish
     return True
 
-
-def connect_device(homing=True):
+def connect_device(homing=True, init=True):
     # Initialize LED interface based on configured provider
     # Note: DW LEDs are initialized at startup in main.py, so we preserve the existing controller
     if state.led_provider == "wled" and state.wled_ip:
@@ -297,6 +309,12 @@ def connect_device(homing=True):
     # 3. First available port as fallback
     elif state.preferred_port and state.preferred_port not in ("__auto__", None) and state.preferred_port in ports:
         logger.info(f"Connecting to preferred port: {state.preferred_port}")
+        
+        # Bluetooth link needs stabilization before initial handshake
+        if "rfcomm" in state.preferred_port.lower():
+            logger.info("Bluetooth link detected. Stabilizing for 3s...")
+            time.sleep(3.0)
+            
         state.conn = SerialConnection(state.preferred_port)
     elif state.port and state.port in ports:
         logger.info(f"Connecting to last used port: {state.port}")
@@ -317,12 +335,14 @@ def connect_device(homing=True):
         # state.conn = WebSocketConnection('ws://fluidnc.local:81')
 
     if (state.conn.is_connected() if state.conn else False):
-        # Check for alarm state and unlock if needed before initializing
-        if not check_and_unlock_alarm():
-            logger.error("Failed to unlock device from alarm state")
-            # Still proceed with device_init but log the issue
+        # Prevent recursion and only proceed with full init if requested
+        if init:
+            # Check for alarm state and unlock if needed before initializing
+            if not check_and_unlock_alarm():
+                logger.error("Failed to unlock device from alarm state")
+                # Still proceed with device_init but log the issue
 
-        device_init(homing)
+            device_init(homing)
 
     # Show connected effect, then transition to configured idle effect
     if state.led_controller:
@@ -622,6 +642,10 @@ def _get_steps_fluidnc():
     x_steps = None
     y_steps = None
 
+    # Clear buffer BEFORE starting (Bluetooth often has 'welcome' noise)
+    state.conn.reset_input_buffer()
+    time.sleep(0.5) # Give Bluetooth a moment to settle
+	
     # Clear buffer
     try:
         while state.conn.in_waiting() > 0:
@@ -632,7 +656,7 @@ def _get_steps_fluidnc():
     # Query X steps/mm
     try:
         state.conn.send("$/axes/x/steps_per_mm\n")
-        time.sleep(0.2)
+        time.sleep(0.4)
 
         start_time = time.time()
         while time.time() - start_time < 2.0:
@@ -1126,7 +1150,7 @@ def home(timeout=120):
                 state.current_theta = offset_radians
                 state.current_rho = 0
 
-                logger.info(f"Sensor homing completed - theta set to {state.angular_homing_offset_degrees}° ({offset_radians:.3f} rad), rho=0")
+                logger.info(f"Sensor homing completed - theta set to {state.angular_homing_offset_degrees}Â° ({offset_radians:.3f} rad), rho=0")
 
             else:
                 logger.info(f"Using crash homing mode at {homing_speed} mm/min")
@@ -1336,7 +1360,6 @@ async def update_machine_position():
         except Exception as e:
             logger.error(f"Error updating machine position: {e}")
 
-
 def perform_soft_reset_sync(max_retries: int = 5):
     """
     Synchronous version of soft reset for use during device initialization.
@@ -1352,15 +1375,9 @@ def perform_soft_reset_sync(max_retries: int = 5):
     Uses exponential backoff for retries:
     - Attempt 1: 5s timeout
     - Attempt 2: 7.5s timeout, 1s delay before retry
-    - Attempt 3: 11s timeout, 2s delay before retry
-    - Attempt 4: 17s timeout, 4s delay before retry
-    - Attempt 5: 25s timeout, 8s delay before retry
-
-    Args:
-        max_retries: Maximum number of reset attempts (default 5)
-
-    Returns:
-        True if reset confirmed, False if all attempts failed
+    - Attempt 3: 11.25s timeout, 2s delay before retry
+    - Attempt 4: 16.875s timeout, 4s delay before retry
+    - Attempt 5: 25.3125s timeout, 8s delay before retry
     """
     if not state.conn or not state.conn.is_connected():
         logger.warning("Cannot perform soft reset: no active connection")
@@ -1369,98 +1386,90 @@ def perform_soft_reset_sync(max_retries: int = 5):
     try:
         # Detect firmware type to use appropriate reset command
         firmware_type, version = _detect_firmware()
-        logger.info(f"Detected firmware: {firmware_type} {version or ''}")
         logger.info(f"Performing soft reset (was: X={state.machine_x:.2f}, Y={state.machine_y:.2f})")
+        
+        is_bluetooth = "rfcomm" in (state.port or "").lower()
 
         for attempt in range(max_retries):
-            # Exponential backoff: 5s * 1.5^attempt → 5s, 7.5s, 11s, 17s, 25s
+            # Exponential backoff: 5s * 1.5^attempt
             timeout = 5.0 * (1.5 ** attempt)
             logger.info(f"Reset attempt {attempt + 1}/{max_retries} (timeout: {timeout:.1f}s)")
-
-            # Clear any pending data first
-            if isinstance(state.conn, SerialConnection):
-                state.conn.reset_input_buffer()
 
             # Send appropriate reset command based on firmware
             if firmware_type == 'fluidnc':
                 # FluidNC uses $Bye for soft reset
-                state.conn.send('$Bye\n')
-                logger.info(f"$Bye sent to {state.port}")
+                try:
+                    state.conn.send('$Bye\n')
+                except Exception:
+                    pass # Connection might be dropping
             else:
                 # GRBL uses Ctrl+X (0x18) for soft reset
-                state.conn.send('\x18')
-                logger.info(f"Ctrl+X (0x18) sent to {state.port}")
-
-            # Wait for controller to fully restart
-            # FluidNC sequence: [MSG:INFO: Restarting] -> ... -> "Grbl 3.9 [FluidNC...]"
-            # GRBL sequence: "Grbl 1.1h ['$' for help]"
-            start_time = time.time()
-            reset_confirmed = False
-            while time.time() - start_time < timeout:
                 try:
-                    response = state.conn.readline()
-                    if response:
-                        logger.debug(f"Reset response: {response}")
-                        # Wait for the "Grbl" startup banner - this means fully ready
-                        if response.startswith("Grbl") or "fluidnc" in response.lower():
-                            reset_confirmed = True
-                            logger.info(f"Controller restart complete: {response}")
-                            break
+                    state.conn.send('\x18')
                 except Exception:
                     pass
-                time.sleep(0.05)
 
-            if reset_confirmed:
-                # Small delay to let controller fully stabilize
-                time.sleep(0.2)
+            # Bluetooth Recovery: Cycling connection prevents [Errno 5] Input/output error
+            if is_bluetooth:
+                logger.info("Bluetooth: Cycling connection...")
+                try:
+                    state.conn.close()
+                except: pass
+                state.conn = None
+                state.is_connected = False
+                
+                # Wait for ESP32 and RFCOMM to cycle
+                time.sleep(12.0) 
+                
+                try:
+                    # IMPORTANT: init=False breaks the recursion loop
+                    connect_device(homing=False, init=False)
+                    logger.info("Bluetooth link re-established. Stabilizing...")
+                    time.sleep(3.0)
+                except Exception as e:
+                    logger.warning(f"Re-connection attempt failed: {e}")
+                    continue
 
-                # Unlock controller in case it's in alarm state after reset
-                logger.info("Sending $X to unlock controller after reset")
-                state.conn.send("$X\n")
-                # Wait for ok response
-                unlock_start = time.time()
-                while time.time() - unlock_start < 1.0:
-                    try:
+            # Verify connection is actually alive before proceeding
+            if state.conn and state.conn.is_connected():
+                try:
+                    # Active verification probe
+                    start_time = time.time()
+                    while time.time() - start_time < 10.0:
+                        # Clear startup chatter
+                        while state.conn.in_waiting() > 0:
+                            state.conn.readline()
+                            
+                        state.conn.send('?\n')
+                        time.sleep(0.5)
+                        
                         response = state.conn.readline()
-                        if response:
-                            logger.debug(f"$X response: {response}")
-                            if response.lower() == "ok":
-                                logger.info("Controller unlocked")
-                                break
-                    except Exception:
-                        pass
-                    time.sleep(0.05)
-
-                # Only reset state positions when confirmation received
-                state.machine_x = 0.0
-                state.machine_y = 0.0
-                reset_cmd = '$Bye' if firmware_type == 'fluidnc' else 'Ctrl+X'
-                logger.info(f"Machine position reset to 0 via {reset_cmd} soft reset")
-
-                # Save the reset position
-                state.save()
-                logger.info(f"Machine position saved: {state.machine_x}, {state.machine_y}")
-                return True
+                        # If we get a status string OR the banner, it's a success
+                        if response and ("<" in response or "Grbl" in response or "fluidnc" in response.lower()):
+                            logger.info(f"Controller confirmed alive: {response.strip()}")
+                            
+                            # SUCCESS: Sync state and exit
+                            state.machine_x = 0.0
+                            state.machine_y = 0.0
+                            state.save()
+                            logger.info("Soft reset successful. Machine zeroed.")
+                            return True
+                except Exception as e:
+                    logger.error(f"Communication error during verification: {e}")
 
             # Retry after failed attempt with exponential backoff delay
             if attempt < max_retries - 1:
-                backoff_delay = 1.0 * (2 ** attempt)  # 1s, 2s, 4s, 8s
-                logger.warning(f"Reset attempt {attempt + 1}/{max_retries} failed, retrying in {backoff_delay:.0f}s...")
+                backoff_delay = 1.0 * (2 ** attempt)
+                logger.warning(f"Attempt failed, retrying in {backoff_delay:.0f}s...")
                 time.sleep(backoff_delay)
 
-        # All attempts failed - DO NOT reset position to prevent drift
-        logger.error(
-            f"All {max_retries} reset attempts failed - no confirmation received. "
-            f"Position NOT reset (still: X={state.machine_x:.2f}, Y={state.machine_y:.2f}). "
-            "This may indicate communication issues or controller not responding."
-        )
+        logger.error(f"All {max_retries} reset attempts failed. Position NOT reset.")
         return False
 
     except Exception as e:
         logger.error(f"Error performing soft reset: {e}")
         return False
-
-
+		
 async def perform_soft_reset():
     """
     Async version of soft reset for use in async contexts (API endpoints, pattern manager).
